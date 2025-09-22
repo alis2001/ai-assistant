@@ -1,1 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+myvenv/
+venv/
+env/
+
+# Audio files
+*.wav
+*.raw
+*.ulaw
+
+# Model directories
 glowtts-male-it/
+
+# Other
+*.log
+*.tmp
