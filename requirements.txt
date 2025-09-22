@@ -1,0 +1,22 @@
+# Core AI/ML Dependencies
+openai-whisper>=20231117
+torch>=2.0.0
+torchvision>=0.15.0
+torchaudio>=2.0.0
+
+# Audio Processing
+sounddevice>=0.4.6
+pyaudio>=0.2.11
+noisereduce>=3.0.0
+scipy>=1.10.0
+numpy>=1.24.0
+
+# Text-to-Speech
+TTS>=0.22.0
+
+# Web/Network
+websockets>=11.0.0
+
+# Optional but recommended for better performance
+librosa>=0.10.0
+soundfile>=0.12.0

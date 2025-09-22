@@ -5,8 +5,8 @@ import audioop
 from queue import Queue
 import threading
 
-HOST = "6.tcp.eu.ngrok.io"  # Replace with your Ngrok host
-PORT = 14684  # Replace with your Ngrok port
+HOST = "localhost"  # Replace with your Ngrok host
+PORT = 8000  # Replace with your Ngrok port
 SAMPLE_RATE = 8000  # µ-law compatible sample rate
 CHUNK_SIZE = 1024  # Audio chunk size
 
