@@ -4,7 +4,9 @@ import audioop
 import numpy as np
 from scipy.signal import resample
 import whisper
-from ollama_cf_parser import OllamaCFParser
+from perfect_cf_parser import PerfectCFParser
+import json
+import time
 
 # Server configuration
 HOST = "0.0.0.0"  # Listen on all network interfaces
@@ -16,7 +18,7 @@ SAMPLE_RATE_TARGET = 16000  # Target sample rate
 model = whisper.load_model("medium")
 print("Whisper model loaded for Italian transcription.")
 print("🧠 Loading Ollama CF parser...")
-cf_parser = OllamaCFParser()
+cf_parser = PerfectCFParser()
 
 def process_and_save_audio(ulaw_data, output_file):
     """
@@ -101,7 +103,6 @@ def handle_client(client_socket, client_address):
                     "method": "Ollama Gemma3"
                 }
                 
-                import json
                 client_socket.sendall(json.dumps(response, ensure_ascii=False).encode("utf-8"))
             else:
                 client_socket.sendall(b"Errore nel salvataggio o nell'elaborazione dell'audio.")
