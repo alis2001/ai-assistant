@@ -1,0 +1,12 @@
+{
+  "timestamp": "2025-10-21 18:35:10",
+  "client_address": "('127.0.0.1', 60012)",
+  "total_bytes": 147697,
+  "call_duration_seconds": 18.09484839439392,
+  "estimated_duration_seconds": 9.231,
+  "call_center_format_claimed": "slin@8000",
+  "actual_format_detected": "A-law (call center quality)",
+  "file_description": "Raw audio data exactly as received from call center",
+  "purpose": "Evidence of actual audio format being sent",
+  "processing_successful": true
+}

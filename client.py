@@ -1,14 +1,17 @@
 import socket
 import sounddevice as sd
 import numpy as np
-import audioop
+import json
 from queue import Queue
 import threading
 import time
+import select
+import sys
+import audioop
 
-HOST = "localhost"  # Replace with your server
-PORT = 8000         # Replace with your server port
-SAMPLE_RATE = 8000  # µ-law compatible sample rate
+HOST = "15.160.171.248"  # AWS test server
+PORT = 8080             # Port 8080
+SAMPLE_RATE = 8000  # slin@8000: 8kHz sample rate
 CHUNK_SIZE = 1024   # Audio chunk size
 RECORDING_TIME = 30 # Maximum recording time in seconds
 
@@ -23,13 +26,20 @@ def audio_callback(indata, frames, time, status):
         print(f"⚠️  Audio stream status: {status}")
     
     if recording_active:
-        pcm_data = (indata * 32768).astype(np.int16)  # Convert float32 to PCM
-        ulaw_data = audioop.lin2ulaw(pcm_data.tobytes(), 2)  # Convert PCM to µ-law
-        audio_queue.put(ulaw_data)
+        # ✅ Convert to µ-law (telephony format)
+        pcm_data = (indata * 32767).astype(np.int16)  # Convert float32 to int16 PCM
+        pcm_bytes = pcm_data.tobytes()  # Convert to bytes
+        ulaw_bytes = audioop.lin2ulaw(pcm_bytes, 2)  # Convert to µ-law
+        
+        # Debug: Print byte info occasionally
+        if len(ulaw_bytes) > 0 and frames % (SAMPLE_RATE * 2) == 0:  # Every 2 seconds
+            print(f"🔍 Sending {len(ulaw_bytes)} bytes (µ-law format)")
+        
+        audio_queue.put(ulaw_bytes)  # Send µ-law bytes (telephony format)
         
         # Show recording progress
         if frames % (SAMPLE_RATE // 4) == 0:  # Every 0.25 seconds
-            print("🎤 Recording... (speak your CF clearly)")
+            print("🎤 Recording µ-law@8000... (speak your CF clearly)")
 
 def audio_streamer(client_socket):
     """Send audio data from the queue to the server."""
@@ -47,11 +57,11 @@ def audio_streamer(client_socket):
             client_socket.sendall(data)
             bytes_sent += len(data)
             
-            # Show progress
+            # Show progress (slin@8000: 2 bytes per sample)
             elapsed = time.time() - start_time
             if elapsed > 0 and bytes_sent % 8192 == 0:  # Every 8KB
-                duration = bytes_sent / 8000  # Approximate duration
-                print(f"📤 Sent {bytes_sent} bytes (~{duration:.1f}s audio)")
+                duration = bytes_sent / (8000 * 2)  # 2 bytes per sample at 8kHz
+                print(f"📤 Sent {bytes_sent} bytes (~{duration:.1f}s slin@8000 audio)")
                 
         except Exception as e:
             print(f"❌ Streaming error: {e}")
@@ -61,30 +71,39 @@ def audio_streamer(client_socket):
     try:
         client_socket.sendall(b"END")
         print("✅ END signal sent to server")
-        print(f"📊 Total sent: {bytes_sent} bytes (~{bytes_sent/8000:.1f}s audio)")
+        total_duration = bytes_sent / (8000 * 2)  # slin@8000 duration calculation
+        print(f"📊 Total sent: {bytes_sent} bytes (~{total_duration:.1f}s slin@8000 audio)")
+        
+        # Check if byte count is even (should be for slin@8000)
+        if bytes_sent % 2 != 0:
+            print(f"⚠️ WARNING: Sent ODD byte count ({bytes_sent}) - this may cause server issues!")
+        else:
+            print(f"✅ Byte count is even ({bytes_sent}) - correct for slin@8000")
+            
     except Exception as e:
         print(f"❌ Error sending END: {e}")
 
 def test_cf_dictation():
-    """Test CF dictation with enhanced client"""
+    """Test CF dictation with slin@8000 client"""
     global recording_active
     
     try:
         # Connect to server
-        print(f"🔗 Connecting to CF server at {HOST}:{PORT}")
+        print(f"🔗 Connecting to slin@8000 CF server at {HOST}:{PORT}")
         client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         client_socket.connect((HOST, PORT))
-        print("✅ Connected to CF server!")
-        
+        print("✅ Connected to slin@8000 CF server!")
+
         # Start audio streaming thread
         recording_active = True
         streamer_thread = threading.Thread(target=audio_streamer, args=(client_socket,))
         streamer_thread.start()
         
         print("\n" + "="*60)
-        print("🎤 CODICE FISCALE DICTATION TEST")
+        print("🎤 SLIN@8000 CODICE FISCALE DICTATION TEST")
         print("="*60)
         print("📋 Instructions:")
+        print("   • Format: slin@8000 (Signed Linear PCM 16-bit @ 8kHz)")
         print("   • Speak clearly and slowly")
         print("   • Use format: 'F come Firenze, R come Roma, otto cinque...'")
         print("   • Press ENTER when finished speaking")
@@ -106,9 +125,6 @@ def test_cf_dictation():
             try:
                 while True:
                     # Check for user input (non-blocking)
-                    import select
-                    import sys
-                    
                     if select.select([sys.stdin], [], [], 0.1) == ([sys.stdin], [], []):
                         input()  # User pressed Enter
                         break
@@ -134,7 +150,7 @@ def test_cf_dictation():
         streamer_thread.join(timeout=5.0)
         
         # Wait for server response
-        print("⏳ Waiting for CF analysis from server...")
+        print("⏳ Waiting for slin@8000 CF analysis from server...")
         try:
             client_socket.settimeout(15.0)  # 15 second timeout for response
             response_data = b""
@@ -147,7 +163,6 @@ def test_cf_dictation():
                 
                 # Try to parse JSON (check if complete)
                 try:
-                    import json
                     response_text = response_data.decode("utf-8")
                     response = json.loads(response_text)
                     break
@@ -156,7 +171,7 @@ def test_cf_dictation():
             
             if response_data:
                 print("\n" + "="*60)
-                print("📋 CF ANALYSIS RESULT:")
+                print("📋 SLIN@8000 CF ANALYSIS RESULT:")
                 print("="*60)
                 
                 try:
@@ -165,8 +180,8 @@ def test_cf_dictation():
                     print(f"🆔 CF Code: {response.get('cf_code', 'N/A')}")
                     print(f"📏 Length: {response.get('length', 0)}/16 characters")
                     print(f"✅ Complete: {'YES' if response.get('is_complete', False) else 'NO'}")
-                    print(f"🎯 Confidence: {response.get('confidence', 'N/A')}")
-                    print(f"⏰ Processing time: {response.get('call_duration', 0):.1f}s")
+                    print(f"🎯 Processing Method: {response.get('processing_method', 'N/A')}")
+                    print(f"⏰ Audio Duration: {response.get('audio_duration', 0):.1f}s")
                     
                     if response.get('is_complete'):
                         print(f"\n🎉 SUCCESS! Complete CF extracted: {response.get('cf_code')}")
@@ -174,6 +189,7 @@ def test_cf_dictation():
                         print(f"\n⚠️  Partial CF extracted. Please dictate remaining characters.")
                         
                 except Exception as e:
+                    print(f"❌ JSON parsing error: {e}")
                     print(f"Raw server response: {response_data.decode('utf-8', errors='ignore')}")
             else:
                 print("❌ No response from server")
@@ -185,7 +201,7 @@ def test_cf_dictation():
 
     except ConnectionRefusedError:
         print(f"❌ Could not connect to {HOST}:{PORT}")
-        print("💡 Make sure your CF server is running!")
+        print("💡 Make sure your slin@8000 CF server is running!")
     except Exception as e:
         print(f"❌ Client error: {e}")
 
@@ -195,7 +211,7 @@ def test_cf_dictation():
             client_socket.close()
         except:
             pass
-        print("🔚 CF dictation test completed")
+        print("🔚 slin@8000 CF dictation test completed")
 
 if __name__ == "__main__":
     # Test audio system first
@@ -203,6 +219,7 @@ if __name__ == "__main__":
         print("🔧 Testing audio system...")
         devices = sd.query_devices()
         print(f"✅ Audio system ready. Found {len(devices)} audio devices.")
+        print(f"🎯 Client configured for slin@8000 (Signed Linear PCM 16-bit @ 8kHz)")
         
         # Run CF dictation test
         test_cf_dictation()

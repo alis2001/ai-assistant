@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>CF Results</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        table { border-collapse: collapse; width: 100%; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+    </style>
+</head>
+<body>
+    <h1>Codici Fiscali elaborati</h1>
+    <div id="results"></div>
+    
+    <script>
+        function loadResults() {
+            fetch('cf_results.jsonl')
+                .then(response => response.text())
+                .then(text => {
+                    const lines = text.trim().split('\n').filter(line => line);
+                    const results = lines.map(line => JSON.parse(line));
+                    
+                    let html = '<table><tr><th>Data</th><th>CF Code</th><th>Complete</th><th>Confidence</th></tr>';
+                    results.forEach(r => {
+                        html += `<tr><td>${r.timestamp}</td><td>${r.cf_code}</td><td>${r.is_complete ? 'Yes' : 'No'}</td><td>${r.confidence}</td></tr>`;
+                    });
+                    html += '</table>';
+                    document.getElementById('results').innerHTML = html;
+                })
+                .catch(e => console.log('Error:', e));
+        }
+        
+        loadResults();
+        setInterval(loadResults, 3000);
+    </script>
+</body>
+</html>
