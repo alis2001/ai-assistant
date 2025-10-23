@@ -16,6 +16,8 @@ import shutil
 from datetime import datetime, timedelta
 import urllib.request
 import urllib.error
+import queue
+import uuid
 
 try:
     import librosa
@@ -44,15 +46,19 @@ print("Loading Whisper LARGE with technical noise optimization...")
 model = whisper.load_model("large")
 print("Technical noise-resistant transcription ready")
 
-active_transcriptions = 0
-transcription_lock = threading.Lock()
+# Professional queuing system for call center
+transcription_queue = queue.Queue()
+transcription_workers = []
+client_responses = {}  # Store client sockets for responses
+response_lock = threading.Lock()
 
-# File management configuration
-AUDIO_DIR = "processed_audio"
-DEBUG_DIR = "debug_audio"
-RAW_EVIDENCE_DIR = "raw_evidence"
-MAX_FILES_PER_DIR = 50  # Keep only latest 50 files per directory
-CLEANUP_AGE_DAYS = 7    # Remove files older than 7 days
+# Two-step workflow tracking
+client_workflows = {}  # Store workflows by client_id
+
+# File management configuration - Only transcription files
+TRANSCRIPTION_DIR = "transcription_files"
+MAX_FILES_PER_DIR = 100  # Keep only latest 100 transcription files
+CLEANUP_AGE_DAYS = 3     # Remove files older than 3 days
 
 # Results log for frontend listing
 CF_RESULTS_LOG = "cf_results.jsonl"
@@ -62,11 +68,9 @@ VM_INGEST_URL = os.environ.get("VM_INGEST_URL")  # e.g., http://10.10.13.122:384
 VM_INGEST_TOKEN = os.environ.get("VM_INGEST_TOKEN")  # shared secret, optional
 
 def setup_directories():
-    """Create and setup directory structure"""
-    directories = [AUDIO_DIR, DEBUG_DIR, RAW_EVIDENCE_DIR]
-    for directory in directories:
-        os.makedirs(directory, exist_ok=True)
-        print(f"📁 Directory ready: {directory}")
+    """Create and setup directory structure - only transcription files"""
+    os.makedirs(TRANSCRIPTION_DIR, exist_ok=True)
+    print(f"📁 Transcription directory ready: {TRANSCRIPTION_DIR}")
 
 def cleanup_old_files(directory, max_files=MAX_FILES_PER_DIR, max_age_days=CLEANUP_AGE_DAYS):
     """Clean up old files in a directory"""
@@ -107,70 +111,17 @@ def cleanup_old_files(directory, max_files=MAX_FILES_PER_DIR, max_age_days=CLEAN
     except Exception as e:
         print(f"⚠️ Cleanup error in {directory}: {e}")
 
-def get_timestamped_filename(directory, prefix, extension="wav"):
-    """Generate timestamped filename in specified directory"""
+def get_transcription_filename(client_id):
+    """Generate transcription filename with client ID and timestamp"""
     timestamp = time.strftime("%Y%m%d_%H%M%S")
-    return os.path.join(directory, f"{prefix}_{timestamp}.{extension}")
+    return os.path.join(TRANSCRIPTION_DIR, f"transcription_{client_id}_{timestamp}.wav")
 
-def cleanup_after_call():
-    """Clean up all files after each call processing"""
+def cleanup_old_transcription_files():
+    """Clean up old transcription files periodically"""
     try:
-        print("🧹 Cleaning up files after call...")
-        
-        # Clean debug files (remove all)
-        if os.path.exists(DEBUG_DIR):
-            debug_files = [f for f in os.listdir(DEBUG_DIR) if f.endswith('.wav')]
-            for file in debug_files:
-                os.remove(os.path.join(DEBUG_DIR, file))
-            if debug_files:
-                print(f"   Removed {len(debug_files)} debug files")
-        
-        # Clean processed audio files (keep only latest 3)
-        if os.path.exists(AUDIO_DIR):
-            audio_files = []
-            for filename in os.listdir(AUDIO_DIR):
-                filepath = os.path.join(AUDIO_DIR, filename)
-                if os.path.isfile(filepath) and filename.endswith('.wav'):
-                    mtime = os.path.getmtime(filepath)
-                    audio_files.append((filepath, mtime))
-            
-            # Sort by modification time (newest first)
-            audio_files.sort(key=lambda x: x[1], reverse=True)
-            
-            # Remove all but the latest 3 files
-            removed_count = 0
-            for filepath, mtime in audio_files[3:]:
-                os.remove(filepath)
-                removed_count += 1
-            
-            if removed_count > 0:
-                print(f"   Removed {removed_count} old processed audio files")
-        
-        # Clean raw evidence files (keep only latest 3)
-        if os.path.exists(RAW_EVIDENCE_DIR):
-            evidence_files = []
-            for filename in os.listdir(RAW_EVIDENCE_DIR):
-                filepath = os.path.join(RAW_EVIDENCE_DIR, filename)
-                if os.path.isfile(filepath) and (filename.endswith('.bin') or filename.endswith('.json')):
-                    mtime = os.path.getmtime(filepath)
-                    evidence_files.append((filepath, mtime))
-            
-            # Sort by modification time (newest first)
-            evidence_files.sort(key=lambda x: x[1], reverse=True)
-            
-            # Remove all but the latest 6 files (3 .bin + 3 .json pairs)
-            removed_count = 0
-            for filepath, mtime in evidence_files[6:]:
-                os.remove(filepath)
-                removed_count += 1
-            
-            if removed_count > 0:
-                print(f"   Removed {removed_count} old evidence files")
-        
-        print("✅ Directory cleanup complete")
-        
+        cleanup_old_files(TRANSCRIPTION_DIR, MAX_FILES_PER_DIR, CLEANUP_AGE_DAYS)
     except Exception as e:
-        print(f"⚠️ Cleanup error: {e}")
+        print(f"⚠️ Transcription cleanup error: {e}")
 
 def append_cf_result(result):
     """Append a single CF result entry to JSONL log for frontend consumption"""
@@ -265,262 +216,204 @@ class TechnicalCFParser:
             'confidence': min(1.0, len(cf_parts) / 16.0) if cf_parts else 0.0
         }
 
-def debug_audio_data(audio_data):
-    """Enhanced debug audio data to find patterns and headers"""
-    print("COMPREHENSIVE AUDIO DEBUG ANALYSIS:")
-    print(f"   Total bytes: {len(audio_data)}")
-    print(f"   🔢 Odd/Even: {'ODD' if len(audio_data) % 2 == 1 else 'EVEN'} (16-bit needs EVEN)")
+class ImpegnativaParser:
+    """Parser for 6-digit impegnativa numbers"""
     
-    if len(audio_data) < 64:
-        print("   Too little data for analysis")
-        return
+    def __init__(self):
+        print("Impegnativa Parser loaded")
     
-    hex_preview = ' '.join([f'{b:02x}' for b in audio_data[:64]])
-    print(f"   First 64 bytes (hex):")
-    print(f"      {hex_preview[:48]}")
-    print(f"      {hex_preview[48:]}")
-    
-    hex_end = ' '.join([f'{b:02x}' for b in audio_data[-32:]])
-    print(f"   Last 32 bytes (hex): {hex_end}")
-    
-    first_bytes = audio_data[:16]
-    print(f"   First 16 bytes as values: {list(first_bytes)}")
-    
-    if audio_data[:4] == b'RIFF':
-        print("   DETECTED: WAV header (RIFF)")
-    elif audio_data[:3] == b'ID3':
-        print("   DETECTED: MP3 ID3 tag")
-    elif audio_data[0:2] == bytes([0xFF, 0xFB]) or audio_data[0:2] == bytes([0xFF, 0xFA]):
-        print("   DETECTED: MP3 frame header")
-    elif len(set(audio_data[:10])) < 3:
-        print("   DETECTED: Very low entropy start (possibly padding/header)")
-    
-    byte_counts = {}
-    for b in audio_data[:1000]:
-        byte_counts[b] = byte_counts.get(b, 0) + 1
-    
-    most_common = sorted(byte_counts.items(), key=lambda x: x[1], reverse=True)[:5]
-    print(f"   Most common bytes (first 1000): {most_common}")
-    
-    if len(audio_data) >= 100:
-        for period in [1, 2, 4, 8, 16, 32]:
-            if len(audio_data) >= period * 10:
-                chunks = [audio_data[i:i+period] for i in range(0, min(100, len(audio_data)), period)]
-                unique_chunks = len(set(chunks))
-                if unique_chunks < len(chunks) * 0.5:
-                    print(f"   PATTERN: Possible {period}-byte repeating pattern detected")
-    
-    print("   🔊 Quick format quality test (first 8000 bytes):")
-    test_data = audio_data[:8000] if len(audio_data) >= 8000 else audio_data
-    
-    formats_to_test = [
-        ("8-bit unsigned", lambda x: np.frombuffer(x, dtype='u1')),
-        ("µ-law", lambda x: np.frombuffer(audioop.ulaw2lin(x, 2), dtype='i2')),
-        ("A-law", lambda x: np.frombuffer(audioop.alaw2lin(x, 2), dtype='i2')),
-    ]
-    
-    if len(test_data) % 2 == 0:
-        formats_to_test.extend([
-            ("16-bit LE", lambda x: np.frombuffer(x, dtype='<i2')),
-            ("16-bit BE", lambda x: np.frombuffer(x, dtype='>i2')),
-            ("slin@8000 (unsigned 16-bit LE)", lambda x: (np.frombuffer(x, dtype='<u2') - 32768).astype(np.int16)),
-            ("slin@8000 (unsigned 16-bit BE)", lambda x: (np.frombuffer(x, dtype='>u2') - 32768).astype(np.int16)),
-        ])
-    
-    for format_name, converter in formats_to_test:
-        try:
-            samples = converter(test_data)
-            if len(samples) > 100:
-                samples_f = samples.astype(np.float32)
-                if format_name == "8-bit unsigned":
-                    samples_f = (samples_f - 128) / 128.0
-                elif "slin@8000" in format_name:
-                    samples_f = samples_f / 32768.0
-                else:
-                    samples_f = samples_f / 32768.0
-                    
-                rms = np.sqrt(np.mean(samples_f**2))
-                peak = np.max(np.abs(samples_f))
-                
-                zero_crossings = np.sum(np.diff(np.sign(samples_f)) != 0)
-                zc_rate = zero_crossings / len(samples_f)
-                
-                print(f"      {format_name}: RMS={rms:.4f}, Peak={peak:.4f}, ZC={zc_rate:.4f}")
-                
-                if 0.05 < rms < 0.8 and peak < 1.0 and 0.01 < zc_rate < 0.3:
-                    print(f"         LOOKS PROMISING!")
-                
-        except Exception as e:
-            print(f"      {format_name}: FAILED ({e})")
-            
-    print("   Look for formats marked as 'LOOKS PROMISING!' above")
+    def parse_impegnativa(self, transcription):
+        """Extract 6-digit number from transcription"""
+        import re
+        
+        # Remove common words and clean text
+        text = transcription.lower()
+        text = re.sub(r'[^\w\s]', ' ', text)  # Remove punctuation
+        words = text.split()
+        
+        # Look for 6-digit numbers
+        for word in words:
+            if word.isdigit() and len(word) == 6:
+                return {
+                    'number': word,
+                    'length': len(word),
+                    'is_valid': True,
+                    'confidence': 1.0
+                }
+        
+        # Look for numbers that might be spoken as separate digits
+        digits = []
+        for word in words:
+            if word.isdigit() and len(word) == 1:
+                digits.append(word)
+        
+        if len(digits) >= 6:
+            # Take first 6 digits
+            number = ''.join(digits[:6])
+            return {
+                'number': number,
+                'length': len(number),
+                'is_valid': True,
+                'confidence': 0.8
+            }
+        
+        # No valid number found
+        return {
+            'number': '',
+            'length': 0,
+            'is_valid': False,
+            'confidence': 0.0
+        }
 
-def save_debug_audio(audio_data, filename_prefix):
-    """Save audio in ALL possible interpretations for debugging"""
-    try:
-        print(f"Creating comprehensive debug files in {DEBUG_DIR}/...")
+class CallCenterWorkflow:
+    """Manages the two-step call center workflow"""
+    
+    def __init__(self):
+        self.step = 1  # 1 = CF, 2 = Impegnativa
+        self.cf_code = ""
+        self.impegnativa = ""
+        self.cf_attempts = 0
+        self.max_cf_attempts = 3
+        self.cf_timeout = 12  # seconds to wait for CF dictation
+        self.impegnativa_timeout = 10  # seconds to wait for impegnativa
+        self.cf_dictation_start = None
+        self.cf_dictation_active = False
         
-        # Clean up old debug files first
-        cleanup_old_files(DEBUG_DIR, max_files=20, max_age_days=3)  # Debug files expire faster
-        
-        if len(audio_data) % 2 == 1:
-            even_data = audio_data[:-1]
+    def get_current_prompt(self):
+        """Get the current prompt for the user"""
+        if self.step == 1:
+            if self.cf_attempts == 0:
+                return "Fornisci il codice fiscale"
+            else:
+                return f"Ripeti il codice fiscale (tentativo {self.cf_attempts + 1}/{self.max_cf_attempts})"
         else:
-            even_data = audio_data
-            
-        debug_files_created = []
+            return "Fornisci il numero dell'impegnativa"
+    
+    def validate_cf(self, cf_code):
+        """Validate CF format (16 characters, alphanumeric)"""
+        if not cf_code or len(cf_code) != 16:
+            return False
         
-        sample_rates = [8000, 16000, 22050, 44100, 11025, 12000]
-        
-        for sr in sample_rates:
-            try:
-                samples_le = np.frombuffer(even_data, dtype='<i2')
-                filename = get_timestamped_filename(DEBUG_DIR, f"{filename_prefix}_16bit_LE_{sr}Hz")
-                with wave.open(filename, "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(sr)
-                    wf.writeframes(samples_le.tobytes())
-                debug_files_created.append(f"16bit_LE_{sr}Hz")
-                
-                samples_be = np.frombuffer(even_data, dtype='>i2')
-                filename = get_timestamped_filename(DEBUG_DIR, f"{filename_prefix}_16bit_BE_{sr}Hz")
-                with wave.open(filename, "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(sr)
-                    wf.writeframes(samples_be.tobytes())
-                debug_files_created.append(f"16bit_BE_{sr}Hz")
-                
-                samples_slin_le = (np.frombuffer(even_data, dtype='<u2') - 32768).astype(np.int16)
-                filename = get_timestamped_filename(DEBUG_DIR, f"{filename_prefix}_slin_LE_{sr}Hz")
-                with wave.open(filename, "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(sr)
-                    wf.writeframes(samples_slin_le.tobytes())
-                debug_files_created.append(f"slin_LE_{sr}Hz")
-                
-                samples_slin_be = (np.frombuffer(even_data, dtype='>u2') - 32768).astype(np.int16)
-                filename = get_timestamped_filename(DEBUG_DIR, f"{filename_prefix}_slin_BE_{sr}Hz")
-                with wave.open(filename, "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(sr)
-                    wf.writeframes(samples_slin_be.tobytes())
-                debug_files_created.append(f"slin_BE_{sr}Hz")
-            except: pass
-        
-        for sr in sample_rates:
-            try:
-                samples_8bit = np.frombuffer(audio_data, dtype='u1')
-                samples_8bit_16 = ((samples_8bit.astype(np.int16) - 128) * 256)
-                filename = get_timestamped_filename(DEBUG_DIR, f"{filename_prefix}_8bit_unsigned_{sr}Hz")
-                with wave.open(filename, "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(sr)
-                    wf.writeframes(samples_8bit_16.tobytes())
-                debug_files_created.append(f"8bit_unsigned_{sr}Hz")
-                
-                samples_8bit_signed = np.frombuffer(audio_data, dtype='i1')
-                samples_8bit_signed_16 = (samples_8bit_signed.astype(np.int16) * 256)
-                filename = get_timestamped_filename(DEBUG_DIR, f"{filename_prefix}_8bit_signed_{sr}Hz")
-                with wave.open(filename, "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(sr)
-                    wf.writeframes(samples_8bit_signed_16.tobytes())
-                debug_files_created.append(f"8bit_signed_{sr}Hz")
-            except: pass
+        # Check if it's alphanumeric
+        if not cf_code.isalnum():
+            return False
             
-        import audioop
-        for sr in sample_rates:
-            # Try A-law first (call center format)
-            try:
-                pcm_data = audioop.alaw2lin(audio_data, 2)
-                filename = get_timestamped_filename(DEBUG_DIR, f"{filename_prefix}_alaw_{sr}Hz")
-                with wave.open(filename, "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(sr)
-                    wf.writeframes(pcm_data)
-                debug_files_created.append(f"alaw_{sr}Hz")
-            except: pass
-            
-            # Try µ-law second (fallback)
-            try:
-                pcm_data = audioop.ulaw2lin(audio_data, 2)
-                filename = get_timestamped_filename(DEBUG_DIR, f"{filename_prefix}_ulaw_{sr}Hz")
-                with wave.open(filename, "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(sr)
-                    wf.writeframes(pcm_data)
-                debug_files_created.append(f"ulaw_{sr}Hz")
-            except: pass
-            
-        header_skips = [1, 2, 4, 8, 16, 32, 64]
-        for skip in header_skips:
-            if len(audio_data) > skip + 1000:
-                try:
-                    data_no_header = audio_data[skip:]
-                    
-                    # Try A-law first (call center format)
-                    pcm_data = audioop.alaw2lin(data_no_header, 2)
-                    with wave.open(f"{filename_prefix}_alaw_skip{skip}_8kHz.wav", "wb") as wf:
-                        wf.setnchannels(1)
-                        wf.setsampwidth(2)
-                        wf.setframerate(8000)
-                        wf.writeframes(pcm_data)
-                    debug_files_created.append(f"alaw_skip{skip}")
-                    
-                    # Try µ-law fallback
-                    pcm_data = audioop.ulaw2lin(data_no_header, 2)
-                    with wave.open(f"{filename_prefix}_ulaw_skip{skip}_8kHz.wav", "wb") as wf:
-                        wf.setnchannels(1)
-                        wf.setsampwidth(2)
-                        wf.setframerate(8000)
-                        wf.writeframes(pcm_data)
-                    debug_files_created.append(f"ulaw_skip{skip}")
-                    
-                    # Try 8-bit unsigned
-                    samples_8bit = np.frombuffer(data_no_header, dtype='u1')
-                    samples_8bit_16 = ((samples_8bit.astype(np.int16) - 128) * 256)
-                    with wave.open(f"{filename_prefix}_8bit_unsigned_skip{skip}_8kHz.wav", "wb") as wf:
-                        wf.setnchannels(1)
-                        wf.setsampwidth(2)
-                        wf.setframerate(8000)
-                        wf.writeframes(samples_8bit_16.tobytes())
-                    debug_files_created.append(f"8bit_unsigned_skip{skip}")
-                    
-                except: pass
-                
-        if len(audio_data) % 4 == 0:
-            try:
-                samples_f32 = np.frombuffer(audio_data, dtype='<f4')
-                samples_clipped = np.clip(samples_f32, -1.0, 1.0)
-                samples_int16 = (samples_clipped * 32767).astype(np.int16)
-                with wave.open(f"{filename_prefix}_32bit_float_LE_8kHz.wav", "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(8000)
-                    wf.writeframes(samples_int16.tobytes())
-                debug_files_created.append("32bit_float_LE")
-            except: pass
-            
-        print(f"Created {len(debug_files_created)} debug files")
-        print(f"LISTEN TO EACH FILE - Find the one with clearest audio:")
-        for i, filename in enumerate(debug_files_created[:20]):
-            print(f"   {i+1:2d}. {filename}")
-        if len(debug_files_created) > 20:
-            print(f"   ... and {len(debug_files_created)-20} more files")
+        return True
+    
+    def validate_impegnativa(self, number):
+        """Validate impegnativa format (6 digits)"""
+        if not number or len(number) != 6:
+            return False
+        return number.isdigit()
+    
+    def process_cf_result(self, transcription, cf_code):
+        """Process CF step result"""
+        self.cf_code = cf_code
         
-        return debug_files_created
+        if self.validate_cf(cf_code):
+            # CF is valid, move to step 2
+            self.step = 2
+            return {
+                "status": "cf_valid",
+                "cf_code": cf_code,
+                "next_prompt": self.get_current_prompt(),
+                "step": 2
+            }
+        else:
+            # CF is invalid, retry or fail
+            self.cf_attempts += 1
+            
+            if self.cf_attempts >= self.max_cf_attempts:
+                return {
+                    "status": "cf_failed",
+                    "message": "Numero massimo di tentativi CF raggiunto",
+                    "cf_code": cf_code,
+                    "attempts": self.cf_attempts
+                }
+            else:
+                return {
+                    "status": "cf_retry",
+                    "cf_code": cf_code,
+                    "next_prompt": self.get_current_prompt(),
+                    "attempts": self.cf_attempts,
+                    "step": 1
+                }
+    
+    def process_impegnativa_result(self, transcription, number):
+        """Process impegnativa step result"""
+        self.impegnativa = number
         
-    except Exception as e:
-        print(f"Debug save error: {e}")
-        return []
+        if self.validate_impegnativa(number):
+            # Both steps completed successfully
+            return {
+                "status": "complete",
+                "cf_code": self.cf_code,
+                "impegnativa": self.impegnativa,
+                "message": "Entrambi i dati raccolti con successo"
+            }
+        else:
+            # Impegnativa invalid, retry
+            return {
+                "status": "impegnativa_retry",
+                "impegnativa": number,
+                "next_prompt": "Ripeti il numero dell'impegnativa (6 cifre)",
+                "step": 2
+            }
+    
+    def get_timeout(self):
+        """Get current step timeout"""
+        if self.step == 1:
+            return self.cf_timeout
+        else:
+            return self.impegnativa_timeout
+    
+    def is_complete(self):
+        """Check if workflow is complete"""
+        return self.step == 2 and self.cf_code and self.impegnativa
+    
+    def start_cf_dictation(self):
+        """Start CF dictation timer"""
+        self.cf_dictation_start = time.time()
+        self.cf_dictation_active = True
+        print(f"⏰ CF dictation started - {self.cf_timeout}s timeout")
+    
+    def check_cf_dictation_timeout(self):
+        """Check if CF dictation should timeout"""
+        if not self.cf_dictation_active or not self.cf_dictation_start:
+            return False
+        
+        elapsed = time.time() - self.cf_dictation_start
+        if elapsed >= self.cf_timeout:
+            self.cf_dictation_active = False
+            print(f"⏰ CF dictation timeout after {elapsed:.1f}s")
+            return True
+        return False
+    
+    def stop_cf_dictation(self):
+        """Stop CF dictation"""
+        self.cf_dictation_active = False
+        if self.cf_dictation_start:
+            elapsed = time.time() - self.cf_dictation_start
+            print(f"⏹️ CF dictation stopped after {elapsed:.1f}s")
+    
+    def should_process_cf_now(self):
+        """Check if we should process CF now (timeout or manual stop)"""
+        return self.check_cf_dictation_timeout() or not self.cf_dictation_active
+
+# Initialize parsers after class definitions
+impegnativa_parser = ImpegnativaParser()
+
+# Import voice player
+try:
+    from voice_player import voice_player
+    VOICE_ENABLED = True  # Re-enable voice prompts with correct protocol
+    print("🔊 Voice prompts enabled with correct call center protocol")
+    print(f"🔊 Voice player object: {voice_player}")
+except ImportError as e:
+    VOICE_ENABLED = False
+    print(f"⚠️ Voice prompts disabled (voice_player.py not found): {e}")
+
+# Debug functions removed - only transcription files are saved
 
 def analyze_audio_characteristics(pcm_array):
     """Analyze audio for processing decisions"""
@@ -760,13 +653,7 @@ def process_slin_audio(audio_data, output_file):
         return False
 
 def transcribe_audio(file_path):
-    """Transcribe using Whisper with concurrency control"""
-    global active_transcriptions
-    
-    with transcription_lock:
-        active_transcriptions += 1
-        print(f"Starting transcription #{active_transcriptions}: {file_path}")
-    
+    """Transcribe using Whisper - called by background workers"""
     try:
         result = model.transcribe(file_path, fp16=False, language="it")
         transcription = result["text"].strip()
@@ -775,21 +662,202 @@ def transcribe_audio(file_path):
     except Exception as e:
         print(f"Transcription error: {e}")
         return "Errore durante la trascrizione."
-    finally:
-        with transcription_lock:
-            active_transcriptions -= 1
 
-def handle_technical_client(client_socket, client_address):
-    """Technical client handling with auto-format detection"""
-    print(f"TECHNICAL CONNECTION: {client_address}")
-    call_start_time = time.time()
+def transcription_worker():
+    """Background worker that processes transcription queue with two-step workflow"""
+    while True:
+        try:
+            # Get next transcription task from queue
+            task = transcription_queue.get()
+            if task is None:  # Shutdown signal
+                break
+                
+            audio_file, client_id, call_start_time = task
+            print(f"🔄 Processing transcription for client {client_id}")
+            
+            # Transcribe the audio
+            transcription = transcribe_audio(audio_file)
+            
+            # Get or create workflow for client
+            if client_id not in client_workflows:
+                client_workflows[client_id] = CallCenterWorkflow()
+                print(f"📋 Started workflow for client {client_id}: {client_workflows[client_id].get_current_prompt()}")
+            
+            workflow = client_workflows[client_id]
+            
+            # Process based on workflow step
+            print(f"🔍 Processing transcription for client {client_id}, current step: {workflow.step}")
+            if workflow.step == 1:
+                # Step 1: Process CF
+                response = _process_cf_step(client_id, transcription, call_start_time, workflow)
+                print(f"🔍 CF step result: {response}")
+            else:
+                # Step 2: Process Impegnativa
+                response = _process_impegnativa_step(client_id, transcription, call_start_time, workflow)
+                print(f"🔍 Impegnativa step result: {response}")
+            
+            # Send response to client
+            _send_workflow_response(client_id, response)
+            
+            # Mark task as done
+            transcription_queue.task_done()
+            
+        except Exception as e:
+            print(f"❌ Transcription worker error: {e}")
+            import traceback
+            traceback.print_exc()
+
+def _process_cf_step(client_id, transcription, call_start_time, workflow):
+    """Process CF step"""
+    cf_parser = TechnicalCFParser()
+    cf_result = cf_parser.parse_cf(transcription)
     
+    # Process through workflow
+    result = workflow.process_cf_result(transcription, cf_result["cf_code"])
+    
+    # Add timing and metadata
+    result.update({
+        "transcription": transcription,
+        "call_duration": time.time() - call_start_time,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "client_id": client_id,
+        "step": workflow.step
+    })
+    
+    return result
+
+def _process_impegnativa_step(client_id, transcription, call_start_time, workflow):
+    """Process impegnativa step"""
+    # Parse impegnativa from transcription
+    impegnativa_result = impegnativa_parser.parse_impegnativa(transcription)
+    
+    # Process through workflow
+    result = workflow.process_impegnativa_result(transcription, impegnativa_result['number'])
+    
+    # Add timing and metadata
+    result.update({
+        "transcription": transcription,
+        "call_duration": time.time() - call_start_time,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "client_id": client_id,
+        "step": workflow.step
+    })
+    
+    return result
+
+def _send_workflow_response(client_id, response):
+    """Send workflow response to client with voice prompts"""
+    with response_lock:
+        if client_id in client_responses:
+            try:
+                client_socket = client_responses[client_id]
+                
+                # Send voice prompt based on workflow status
+                if VOICE_ENABLED:
+                    print(f"🔊 VOICE_ENABLED is True, sending voice prompt...")
+                    try:
+                        _send_voice_prompt_for_response(client_socket, response)
+                    except Exception as e:
+                        print(f"⚠️ Voice prompt failed, sending text prompt: {e}")
+                        _send_text_prompt_for_response(client_socket, response)
+                else:
+                    print(f"⚠️ VOICE_ENABLED is False, sending text prompt")
+                    _send_text_prompt_for_response(client_socket, response)
+                
+                # Send JSON response
+                response_json = json.dumps(response, ensure_ascii=False, indent=2)
+                client_socket.sendall(response_json.encode("utf-8"))
+                
+                # Only close connection if workflow is complete or failed
+                status = response.get('status')
+                if status in ['complete', 'cf_failed']:
+                    # Workflow finished - close connection and cleanup
+                    client_socket.close()
+                    del client_responses[client_id]
+                    if client_id in client_workflows:
+                        del client_workflows[client_id]
+                    print(f"✅ Workflow completed for client {client_id}")
+                else:
+                    # Workflow continues - keep connection open
+                    print(f"⏳ Workflow step {response.get('step', 1)} for client {client_id} - connection kept open for next step")
+                    
+            except Exception as e:
+                print(f"❌ Failed to send workflow response to client {client_id}: {e}")
+                if client_id in client_responses:
+                    del client_responses[client_id]
+                if client_id in client_workflows:
+                    del client_workflows[client_id]
+
+def _send_voice_prompt_for_response(client_socket, response):
+    """Send appropriate voice prompt based on response status"""
     try:
+        status = response.get('status')
+        print(f"🔊 Sending voice prompt for status: {status}")
+        
+        if status == 'cf_valid':
+            voice_player.play_workflow_prompt(client_socket, "impegnativa_request")
+            print(f"🔊 Sent impegnativa_request prompt")
+        elif status == 'cf_retry':
+            attempts = response.get('attempts', 0)
+            voice_player.play_workflow_prompt(client_socket, "cf_retry", attempts)
+            print(f"🔊 Sent cf_retry prompt (attempt {attempts})")
+        elif status == 'cf_failed':
+            voice_player.play_workflow_prompt(client_socket, "cf_failed")
+            print(f"🔊 Sent cf_failed prompt")
+        elif status == 'impegnativa_retry':
+            voice_player.play_workflow_prompt(client_socket, "impegnativa_retry")
+            print(f"🔊 Sent impegnativa_retry prompt")
+        elif status == 'complete':
+            voice_player.play_workflow_prompt(client_socket, "success")
+            print(f"🔊 Sent success prompt")
+        else:
+            voice_player.play_workflow_prompt(client_socket, "error")
+            print(f"🔊 Sent error prompt")
+            
+    except Exception as e:
+        print(f"⚠️ Failed to send voice prompt: {e}")
+
+def _send_text_prompt_for_response(client_socket, response):
+    """Send text prompt based on response status"""
+    try:
+        status = response.get('status')
+        print(f"📝 Sending text prompt for status: {status}")
+        
+        if status == 'cf_valid':
+            prompt = "Perfetto! Ora fornisci il numero dell'impegnativa (6 cifre)."
+        elif status == 'cf_retry':
+            attempts = response.get('attempts', 0)
+            prompt = f"Codice fiscale non valido. Ripeti il codice fiscale (tentativo {attempts + 1}/3)."
+        elif status == 'cf_failed':
+            prompt = "Numero massimo di tentativi raggiunto. Chiamata terminata."
+        elif status == 'impegnativa_retry':
+            prompt = "Numero impegnativa non valido. Ripeti il numero dell'impegnativa (6 cifre)."
+        elif status == 'complete':
+            prompt = "Perfetto! Entrambi i dati sono stati raccolti con successo. Chiamata completata."
+        else:
+            prompt = "Si è verificato un errore. Riprova."
+        
+        # Send text prompt as simple message
+        prompt_data = f"PROMPT:{prompt}".encode("utf-8")
+        print(f"📝 Sending text prompt data: {prompt_data}")
+        client_socket.sendall(prompt_data)
+        print(f"📝 Text prompt sent successfully: {prompt}")
+        
+    except Exception as e:
+        print(f"⚠️ Failed to send text prompt: {e}")
+
+def _continue_listening_for_step2(client_socket, client_id, call_start_time):
+    """Continue listening for step 2 (impegnativa) after step 1 is complete"""
+    try:
+        workflow = client_workflows[client_id]
+        print(f"🔄 Continuing workflow for client {client_id} - step {workflow.step}")
+        
         audio_data = b""
         last_data_time = time.time()
         client_socket.settimeout(CLIENT_TIMEOUT)
         
-        print(f"Receiving audio data with auto-format detection (max {CF_DICTATION_TIME:.0f}s)...")
+        timeout_duration = workflow.get_timeout()
+        print(f"Receiving audio data for step {workflow.step} (timeout: {timeout_duration}s)...")
         
         while True:
             current_time = time.time()
@@ -797,6 +865,11 @@ def handle_technical_client(client_socket, client_address):
             
             if call_duration > MAX_CALL_DURATION:
                 print(f"⏰ Maximum duration reached")
+                break
+            
+            # Check timeout for step 2
+            if current_time - last_data_time > timeout_duration:
+                print(f"⏰ Step 2 timeout - processing {len(audio_data)} bytes")
                 break
             
             try:
@@ -816,125 +889,221 @@ def handle_technical_client(client_socket, client_address):
                 if len(audio_data) % 16384 == 0:
                     estimated_samples = len(audio_data) // 2
                     duration = estimated_samples / SAMPLE_RATE_ORIGINAL
-                    print(f"Received ~{duration:.1f}s audio ({len(audio_data)} bytes) - expecting slin@8000...")
+                    print(f"Received ~{duration:.1f}s audio ({len(audio_data)} bytes) - step {workflow.step}")
                 
             except socket.timeout:
                 time_since_data = current_time - last_data_time
                 
-                if time_since_data > CF_DICTATION_TIME:
+                if time_since_data > timeout_duration:
+                    print(f"⏰ Step 2 timeout - processing {len(audio_data)} bytes")
+                    break
+                elif time_since_data > CF_DICTATION_TIME:
                     print(f"⏰ Processing timeout - using {len(audio_data)} bytes")
                     break
                 elif len(audio_data) == 0:
                     print(f"⏰ No initial data timeout")
                     break
-
+        
         if len(audio_data) > 0:
-            print(f"Processing {len(audio_data)} bytes with auto-format detection...")
+            print(f"Processing {len(audio_data)} bytes for step {workflow.step}...")
             
-            timestamp = time.strftime("%Y%m%d_%H%M%S")
-            
-            os.makedirs("raw_evidence", exist_ok=True)
-            raw_filename = f"raw_evidence/raw_audio_evidence_{timestamp}.bin"
-            metadata_filename = f"raw_evidence/raw_audio_metadata_{timestamp}.json"
-            
-            with open(raw_filename, "wb") as raw_file:
-                raw_file.write(audio_data)
-            print(f"Raw audio evidence saved: {raw_filename} ({len(audio_data)} bytes)")
-            
-            metadata = {
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "client_address": str(client_address),
-                "total_bytes": len(audio_data),
-                "call_duration_seconds": time.time() - call_start_time,
-                "estimated_duration_seconds": len(audio_data) // 2 / SAMPLE_RATE_ORIGINAL,
-                "call_center_format_claimed": "slin@8000",
-                "actual_format_detected": "unknown",
-                "file_description": "Raw audio data exactly as received from call center",
-                "purpose": "Evidence of actual audio format being sent"
-            }
-            
-            with open(metadata_filename, "w") as meta_file:
-                json.dump(metadata, meta_file, indent=2)
-            print(f"Raw audio metadata saved: {metadata_filename}")
-            
-            output_file = get_timestamped_filename(AUDIO_DIR, "processed_audio")
-            
+            output_file = get_transcription_filename(client_id)
             success, format_detected = process_slin_audio(audio_data, output_file)
             
-            def update_raw_metadata(actual_format):
-                try:
-                    with open(metadata_filename, "r") as meta_file:
-                        metadata = json.load(meta_file)
-                    metadata["actual_format_detected"] = actual_format
-                    metadata["processing_successful"] = success
-                    with open(metadata_filename, "w") as meta_file:
-                        json.dump(metadata, meta_file, indent=2)
-                except:
-                    pass
-            
-            update_raw_metadata(format_detected)
-            
             if success:
-                transcription = transcribe_audio(output_file)
+                print(f"✅ Audio processed successfully for client {client_id} (step {workflow.step})")
                 
-                cf_parser = TechnicalCFParser()
-                cf_result = cf_parser.parse_cf(transcription)
+                # Store client socket for response
+                with response_lock:
+                    client_responses[client_id] = client_socket
                 
-                call_duration = time.time() - call_start_time
-                estimated_samples = len(audio_data) // 2
-                audio_duration = estimated_samples / SAMPLE_RATE_ORIGINAL
+                # Add to transcription queue (FIFO - First In, First Out)
+                transcription_queue.put((output_file, client_id, call_start_time))
                 
-                print("=" * 60)
-                print("CF ANALYSIS RESULTS:")
-                print("=" * 60)
-                print(f"📝 Raw transcription: {transcription}")
-                print(f"🆔 CF Code: {cf_result['cf_code']}")
-                print(f"📏 Length: {cf_result['length']}/16 characters")
-                print(f"Complete: {'YES' if cf_result['is_complete'] else 'NO'}")
-                print(f"Confidence: {cf_result['confidence']:.2f}")
-                print(f"Call duration: {call_duration:.1f}s")
-                print(f"Audio duration: {audio_duration:.1f}s")
-                print("=" * 60)
+                print(f"⏳ Client {client_id} queued for transcription (step {workflow.step})")
+                print(f"📊 Queue status: {transcription_queue.qsize()} clients waiting")
                 
-                response = {
-                    "status": "success",
-                    "transcription": transcription,
-                    "cf_code": cf_result["cf_code"],
-                    "length": cf_result["length"],
-                    "is_complete": cf_result["is_complete"],
-                    "confidence": cf_result["confidence"],
-                    "cf_parts": cf_result["parts"],
-                    "call_duration": call_duration,
-                    "audio_duration": audio_duration,
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
-                }
-                
-                # Append to results log for frontend listing
-                try:
-                    append_cf_result(response)
-                except Exception as e:
-                    print(f"⚠️ CF result logging failed: {e}")
-
-                response_json = json.dumps(response, ensure_ascii=False, indent=2)
-                client_socket.sendall(response_json.encode("utf-8"))
-
-                # Also try to push to VM frontend if configured
-                try:
-                    post_cf_result_to_vm(response)
-                except Exception as e:
-                    print(f"⚠️ Push to VM failed: {e}")
+                # Wait for final transcription to complete
+                while client_id in client_responses:
+                    time.sleep(0.1)
                 
             else:
-                print("Multi-format audio processing failed completely")
-                update_raw_metadata("FAILED - No format could be processed")
+                print(f"❌ Audio processing failed for client {client_id}")
                 error_response = {
                     "status": "error",
-                    "message": "Multi-format audio processing failed",
-                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                    "message": "Audio processing failed",
+                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "client_id": client_id,
+                    "step": workflow.step
                 }
                 client_socket.sendall(json.dumps(error_response).encode("utf-8"))
         else:
-            print("No audio data received")
+            print("No audio data received for step 2")
+            
+    except Exception as e:
+        print(f"Error in step 2 continuation: {e}")
+        import traceback
+        traceback.print_exc()
+
+def handle_technical_client(client_socket, client_address):
+    """Technical client handling with professional queuing and voice prompts"""
+    client_id = str(uuid.uuid4())[:8]  # Short unique ID
+    print(f"📞 CALL CENTER CONNECTION: {client_address} (ID: {client_id})")
+    call_start_time = time.time()
+    
+    # Send welcome message
+    if VOICE_ENABLED:
+        try:
+            print(f"🔊 Attempting to send welcome prompt to client {client_id}")
+            voice_player.play_workflow_prompt(client_socket, "start")
+            print(f"🔊 Welcome prompt sent to client {client_id}")
+        except Exception as e:
+            print(f"⚠️ Failed to send welcome prompt: {e}")
+            # Fallback to text prompt
+            try:
+                welcome_text = "PROMPT:Benvenuto! Fornisci il tuo codice fiscale (16 caratteri)."
+                client_socket.sendall(welcome_text.encode("utf-8"))
+                print(f"📝 Welcome text prompt sent to client {client_id}")
+            except Exception as e2:
+                print(f"⚠️ Failed to send welcome text prompt: {e2}")
+    else:
+        print(f"⚠️ Voice prompts disabled - skipping welcome message")
+        print(f"🔍 Client {client_id} connected, waiting for audio input...")
+        print(f"🔍 Socket info: {client_socket.getsockname()} -> {client_socket.getpeername()}")
+    
+    # Initialize workflow for client
+    if client_id not in client_workflows:
+        client_workflows[client_id] = CallCenterWorkflow()
+        print(f"📋 Started workflow for client {client_id}")
+    
+    workflow = client_workflows[client_id]
+    print(f"🔍 Workflow initialized for client {client_id}, step: {workflow.step}")
+    
+    try:
+        # Handle the complete workflow in a loop
+        while not workflow.is_complete():
+            audio_data = b""
+            last_data_time = time.time()
+            client_socket.settimeout(CLIENT_TIMEOUT)
+            
+            current_step = workflow.step
+            timeout_duration = workflow.get_timeout()
+            
+            # Start CF dictation timer for step 1
+            if current_step == 1:
+                workflow.start_cf_dictation()
+            
+            print(f"Receiving audio data for step {current_step} (timeout: {timeout_duration}s)...")
+            
+            while True:
+                current_time = time.time()
+                call_duration = current_time - call_start_time
+                
+                if call_duration > MAX_CALL_DURATION:
+                    print(f"⏰ Maximum duration reached")
+                    break
+                
+                # Check timeout for current step
+                if current_step == 1 and workflow.should_process_cf_now():
+                    print(f"⏰ CF dictation timeout - processing {len(audio_data)} bytes")
+                    break
+                elif current_step == 2 and current_time - last_data_time > timeout_duration:
+                    print(f"⏰ Step 2 timeout - processing {len(audio_data)} bytes")
+                    break
+                
+                try:
+                    data = client_socket.recv(4096)
+                    
+                    if not data:
+                        print(f"⚠️ Client disconnected - processing {len(audio_data)} bytes")
+                        print(f"🔍 Client {client_id} disconnected during step {current_step}")
+                        print(f"🔍 Audio data received so far: {len(audio_data)} bytes")
+                        break
+                        
+                    if data == b"END":
+                        print("END signal received")
+                        if current_step == 1:
+                            workflow.stop_cf_dictation()
+                        break
+                    
+                    audio_data += data
+                    last_data_time = current_time
+                    
+                    if len(audio_data) % 16384 == 0:
+                        estimated_samples = len(audio_data) // 2
+                        duration = estimated_samples / SAMPLE_RATE_ORIGINAL
+                        print(f"Received ~{duration:.1f}s audio ({len(audio_data)} bytes) - step {current_step}")
+                    
+                except socket.timeout:
+                    time_since_data = current_time - last_data_time
+                    
+                    # Check if we should process based on workflow step
+                    if current_step == 1 and workflow.should_process_cf_now():
+                        print(f"⏰ CF dictation timeout - processing {len(audio_data)} bytes")
+                        break
+                    elif current_step == 2 and time_since_data > timeout_duration:
+                        print(f"⏰ Step 2 timeout - processing {len(audio_data)} bytes")
+                        break
+                    elif time_since_data > CF_DICTATION_TIME:
+                        print(f"⏰ Processing timeout - using {len(audio_data)} bytes")
+                        break
+                    elif len(audio_data) == 0:
+                        print(f"⏰ No initial data timeout")
+                        break
+
+            if len(audio_data) > 0:
+                print(f"Processing {len(audio_data)} bytes for step {current_step}...")
+                
+                output_file = get_transcription_filename(client_id)
+                success, format_detected = process_slin_audio(audio_data, output_file)
+                
+                if success:
+                    print(f"✅ Audio processed successfully for client {client_id} (step {current_step})")
+                    
+                    # Store client socket for response
+                    with response_lock:
+                        client_responses[client_id] = client_socket
+                    
+                    # Add to transcription queue (FIFO - First In, First Out)
+                    transcription_queue.put((output_file, client_id, call_start_time))
+                    
+                    print(f"⏳ Client {client_id} queued for transcription (step {current_step})")
+                    print(f"📊 Queue status: {transcription_queue.qsize()} clients waiting")
+                    
+                    # Wait for transcription to complete before continuing
+                    # This ensures the workflow progresses step by step
+                    while client_id in client_responses:
+                        time.sleep(0.1)
+                    
+                    # Debug workflow state
+                    print(f"🔍 Workflow state after transcription: step={workflow.step}, cf_attempts={workflow.cf_attempts}, cf_code='{workflow.cf_code}', impegnativa='{workflow.impegnativa}'")
+                    
+                    # Check if workflow is complete or failed
+                    if workflow.is_complete():
+                        print(f"✅ Workflow completed successfully for client {client_id}")
+                        break
+                    elif workflow.cf_attempts >= workflow.max_cf_attempts:
+                        print(f"❌ Workflow failed - max CF attempts reached for client {client_id}")
+                        break
+                    else:
+                        print(f"🔄 Workflow continuing to step {workflow.step} for client {client_id}")
+                        # Continue to next step - don't break, let the outer loop continue
+                        continue
+                        
+                else:
+                    print(f"❌ Audio processing failed for client {client_id}")
+                    error_response = {
+                        "status": "error",
+                        "message": "Audio processing failed",
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "client_id": client_id,
+                        "step": current_step
+                    }
+                    client_socket.sendall(json.dumps(error_response).encode("utf-8"))
+                    break
+            else:
+                print("No audio data received")
+                break
 
     except Exception as e:
         print(f"Technical client error: {e}")
@@ -948,49 +1117,67 @@ def handle_technical_client(client_socket, client_address):
             pass
         
         total_time = time.time() - call_start_time
-        print(f"🔚 Technical call completed: {total_time:.1f}s")
-        
-        # Clean up files after processing
-        cleanup_after_call()
-        
+        print(f"🔚 Call completed for client {client_id}: {total_time:.1f}s")
         print("=" * 50)
 
 def start_technical_server():
     """Start technical server with auto-format detection"""
     # Setup directories and cleanup
     setup_directories()
-    cleanup_old_files(AUDIO_DIR)
-    cleanup_old_files(RAW_EVIDENCE_DIR)
+    cleanup_old_transcription_files()
     
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server_socket:
             server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             server_socket.bind((HOST, PORT))
-            server_socket.listen(5)
+            server_socket.listen(1000)  # Allow 1000 pending connections for large call center
             
-            print("HIGH-QUALITY CF SERVER (Call Center Approach)")
+            # Start background transcription workers
+            print("🚀 Starting professional call center queuing system...")
+            num_workers = 1  # Start with 1 worker (can be increased for multiple GPUs)
+            for i in range(num_workers):
+                worker = threading.Thread(target=transcription_worker, daemon=True)
+                worker.start()
+                transcription_workers.append(worker)
+                print(f"✅ Transcription worker {i+1} started")
+            
+            print("PROFESSIONAL CALL CENTER TWO-STEP WORKFLOW SERVER")
             print("=" * 60)
             print(f"📍 Listening: {HOST}:{PORT}")
+            print(f"👥 Max connections: 1000 (unlimited callers)")
+            print(f"🔄 Transcription workers: {num_workers}")
+            print(f"📋 Queue system: FIFO (First In, First Out)")
+            print(f"🎯 WORKFLOW: Step 1 = CF (16 chars), Step 2 = Impegnativa (6 digits)")
+            print(f"⏱️ TIMING: CF=12s dictation timeout, Impegnativa=10s timeout")
+            print(f"🔄 RETRIES: CF max 3 attempts, Impegnativa unlimited")
             print(f"🎯 FORMAT: A-law with call center quality processing")
             print(f"🔧 FRAME PROTOCOL: 3-byte headers with type 0x10 frames")
             print(f"🎵 CUSTOM DECODER: Call center's exact A-law decoder")
             print(f"🎛️ FFMPEG FILTERS: highpass=200, lowpass=3400, dynaudnorm")
             print(f"📊 Sample rate: 8kHz → 16kHz (quality resampling)")
-            print(f"🧹 AUTO-CLEANUP: Removes files after each call")
-            print(f"📁 Organized directories: processed_audio/, raw_evidence/")
+            print(f"🧹 AUTO-CLEANUP: Removes old transcription files")
+            print(f"📁 Directory: {TRANSCRIPTION_DIR}/ (transcription files only)")
             print(f"🔤 CF Parser: Simple first-letter extraction (no mapping)")
+            print(f"🔢 Impegnativa Parser: 6-digit number extraction")
             
             if torch.cuda.is_available():
                 gpu_name = torch.cuda.get_device_name(0)
-                print(f"GPU: {gpu_name}")
+                print(f"🎮 GPU: {gpu_name}")
             
-            print("Ready for comprehensive audio format detection...")
+            print("✅ Ready for unlimited call center connections...")
             print("=" * 60)
 
             while True:
                 try:
                     client_socket, client_address = server_socket.accept()
-                    handle_technical_client(client_socket, client_address)
+                    # Handle each client in a separate thread for unlimited connections
+                    client_thread = threading.Thread(
+                        target=handle_technical_client, 
+                        args=(client_socket, client_address),
+                        daemon=True
+                    )
+                    client_thread.start()
+                    print(f"📞 New client thread started for {client_address}")
                 except KeyboardInterrupt:
                     print("\n🛑 Server shutdown")
                     break
