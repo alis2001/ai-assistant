@@ -1108,9 +1108,9 @@ def handle_technical_client(client_socket, client_address):
                             workflow.start_cf_dictation()
                             print(f"🔍 Restarted CF dictation timer for next attempt")
                         
-                        # Break out of inner audio collection loop to continue outer workflow loop
-                        print(f"🔍 Breaking out of inner audio collection loop...")
-                        break
+                        # Continue to next iteration of the outer workflow loop
+                        print(f"🔍 Continuing to next workflow iteration...")
+                        continue
                         
                 else:
                     print(f"❌ Audio processing failed for client {client_id}")
@@ -1127,8 +1127,8 @@ def handle_technical_client(client_socket, client_address):
                 print("No audio data received")
                 break
         
-        # Continue to next iteration of the outer loop
-        print(f"🔍 Continuing to next workflow iteration...")
+        # This point should not be reached if the workflow is continuing properly
+        print(f"🔍 Workflow ended - this should not happen if workflow is continuing")
 
     except Exception as e:
         print(f"Technical client error: {e}")
