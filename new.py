@@ -757,16 +757,21 @@ def _send_workflow_response(client_id, response):
                     print(f"🔊 VOICE_ENABLED is True, sending voice prompt...")
                     try:
                         _send_voice_prompt_for_response(client_socket, response)
+                        print(f"🔊 Voice prompt sent, skipping JSON response")
+                        # Don't send JSON response when using voice prompts
+                        # The client expects only audio, not JSON
                     except Exception as e:
                         print(f"⚠️ Voice prompt failed, sending text prompt: {e}")
                         _send_text_prompt_for_response(client_socket, response)
+                        # Send JSON response only if voice prompt failed
+                        response_json = json.dumps(response, ensure_ascii=False, indent=2)
+                        client_socket.sendall(response_json.encode("utf-8"))
                 else:
                     print(f"⚠️ VOICE_ENABLED is False, sending text prompt")
                     _send_text_prompt_for_response(client_socket, response)
-                
-                # Send JSON response
-                response_json = json.dumps(response, ensure_ascii=False, indent=2)
-                client_socket.sendall(response_json.encode("utf-8"))
+                    # Send JSON response when using text prompts
+                    response_json = json.dumps(response, ensure_ascii=False, indent=2)
+                    client_socket.sendall(response_json.encode("utf-8"))
                 
                 # Only close connection if workflow is complete or failed
                 status = response.get('status')
@@ -780,6 +785,10 @@ def _send_workflow_response(client_id, response):
                 else:
                     # Workflow continues - keep connection open
                     print(f"⏳ Workflow step {response.get('step', 1)} for client {client_id} - connection kept open for next step")
+                    print(f"🔍 Client should continue listening for audio input...")
+                    # Remove client from responses so main workflow loop can continue
+                    del client_responses[client_id]
+                    print(f"🔍 Removed client {client_id} from responses - main loop can continue")
                     
             except Exception as e:
                 print(f"❌ Failed to send workflow response to client {client_id}: {e}")
@@ -982,6 +991,7 @@ def handle_technical_client(client_socket, client_address):
     try:
         # Handle the complete workflow in a loop
         while not workflow.is_complete():
+            
             audio_data = b""
             last_data_time = time.time()
             client_socket.settimeout(CLIENT_TIMEOUT)
@@ -993,7 +1003,7 @@ def handle_technical_client(client_socket, client_address):
             if current_step == 1:
                 workflow.start_cf_dictation()
             
-            print(f"Receiving audio data for step {current_step} (timeout: {timeout_duration}s)...")
+            print(f"🔍 Starting audio collection for step {current_step} (timeout: {timeout_duration}s)...")
             
             while True:
                 current_time = time.time()
@@ -1018,6 +1028,7 @@ def handle_technical_client(client_socket, client_address):
                         print(f"⚠️ Client disconnected - processing {len(audio_data)} bytes")
                         print(f"🔍 Client {client_id} disconnected during step {current_step}")
                         print(f"🔍 Audio data received so far: {len(audio_data)} bytes")
+                        print(f"🔍 Workflow state: step={workflow.step}, cf_attempts={workflow.cf_attempts}")
                         break
                         
                     if data == b"END":
@@ -1087,8 +1098,19 @@ def handle_technical_client(client_socket, client_address):
                         break
                     else:
                         print(f"🔄 Workflow continuing to step {workflow.step} for client {client_id}")
-                        # Continue to next step - don't break, let the outer loop continue
-                        continue
+                        print(f"🔍 Continuing to listen for next audio input...")
+                        print(f"🔍 Workflow is_complete(): {workflow.is_complete()}")
+                        print(f"🔍 CF attempts: {workflow.cf_attempts}/{workflow.max_cf_attempts}")
+                        print(f"🔍 About to continue to main workflow loop...")
+                        
+                        # Restart CF dictation timer for next attempt
+                        if workflow.step == 1:
+                            workflow.start_cf_dictation()
+                            print(f"🔍 Restarted CF dictation timer for next attempt")
+                        
+                        # Break out of inner audio collection loop to continue outer workflow loop
+                        print(f"🔍 Breaking out of inner audio collection loop...")
+                        break
                         
                 else:
                     print(f"❌ Audio processing failed for client {client_id}")
@@ -1104,6 +1126,9 @@ def handle_technical_client(client_socket, client_address):
             else:
                 print("No audio data received")
                 break
+        
+        # Continue to next iteration of the outer loop
+        print(f"🔍 Continuing to next workflow iteration...")
 
     except Exception as e:
         print(f"Technical client error: {e}")

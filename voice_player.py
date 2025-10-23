@@ -83,6 +83,7 @@ class VoicePlayer:
                 # Send the WAV data in 320-byte frames with headers
                 frame_size = 320
                 offset = 0
+                frame_count = 0
                 
                 while offset < len(wav_data):
                     # Get frame data
@@ -93,7 +94,14 @@ class VoicePlayer:
                     
                     # Send frame with header
                     frame = get_header() + frame_data
-                    client_socket.sendall(frame)
+                    try:
+                        client_socket.sendall(frame)
+                        frame_count += 1
+                        if frame_count % 10 == 0:  # Log every 10th frame
+                            print(f"🔊 Sent frame {frame_count} ({len(frame)} bytes)")
+                    except (ConnectionResetError, BrokenPipeError) as e:
+                        print(f"⚠️ Client disconnected during frame {frame_count}: {e}")
+                        return False
                     
                     offset += frame_size
                     
