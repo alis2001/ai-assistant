@@ -174,7 +174,8 @@ class TechnicalCFParser:
         print("Technical CF Parser loaded")
     
     def parse_cf(self, transcription):
-        """Simple CF parsing - NO MAPPING, just extract first letters and numbers"""
+        """Simple CF parsing - NO MAPPING, just extract first letters and numbers
+        Large words (up to 8 capital letters) are treated as individual letters"""
         
         words = transcription.replace(',', ' ').replace('-', ' ').replace('.', ' ').split()
         
@@ -188,8 +189,8 @@ class TechnicalCFParser:
                 cf_parts.append(word)
                 continue
             
-            # Words - check if it's 1-3 capital letters (treat as individual letters)
-            if word.isalpha() and len(word) <= 3 and word.isupper():
+            # Words - check if it's 1-8 capital letters (treat as individual letters)
+            if word.isalpha() and len(word) <= 8 and word.isupper():
                 for char in word:
                     cf_parts.append(char)
                 continue
@@ -278,6 +279,8 @@ class CallCenterWorkflow:
         self.impegnativa_timeout = 10  # seconds to wait for impegnativa
         self.cf_dictation_start = None
         self.cf_dictation_active = False
+        self.impegnativa_dictation_start = None
+        self.impegnativa_dictation_active = False
         
     def get_current_prompt(self):
         """Get the current prompt for the user"""
@@ -313,6 +316,8 @@ class CallCenterWorkflow:
         if self.validate_cf(cf_code):
             # CF is valid, move to step 2
             self.step = 2
+            # Start Impegnativa dictation timer
+            self.start_impegnativa_dictation()
             return {
                 "status": "cf_valid",
                 "cf_code": cf_code,
@@ -377,6 +382,12 @@ class CallCenterWorkflow:
         self.cf_dictation_active = True
         print(f"⏰ CF dictation started - {self.cf_timeout}s timeout")
     
+    def start_impegnativa_dictation(self):
+        """Start Impegnativa dictation timer"""
+        self.impegnativa_dictation_start = time.time()
+        self.impegnativa_dictation_active = True
+        print(f"⏰ Impegnativa dictation started - {self.impegnativa_timeout}s timeout")
+    
     def check_cf_dictation_timeout(self):
         """Check if CF dictation should timeout"""
         if not self.cf_dictation_active or not self.cf_dictation_start:
@@ -387,6 +398,19 @@ class CallCenterWorkflow:
             self.cf_dictation_active = False
             print(f"⏰ CF dictation timeout after {elapsed:.1f}s")
             return True
+        return False
+    
+    def check_impegnativa_dictation_timeout(self):
+        """Check if Impegnativa dictation should timeout"""
+        if not self.impegnativa_dictation_active or not self.impegnativa_dictation_start:
+            return False
+        
+        elapsed = time.time() - self.impegnativa_dictation_start
+        if elapsed >= self.impegnativa_timeout:
+            self.impegnativa_dictation_active = False
+            print(f"⏰ Impegnativa dictation timeout after {elapsed:.1f}s")
+            return True
+        
         return False
     
     def stop_cf_dictation(self):
@@ -1017,7 +1041,7 @@ def handle_technical_client(client_socket, client_address):
                 if current_step == 1 and workflow.should_process_cf_now():
                     print(f"⏰ CF dictation timeout - processing {len(audio_data)} bytes")
                     break
-                elif current_step == 2 and current_time - last_data_time > timeout_duration:
+                elif current_step == 2 and workflow.check_impegnativa_dictation_timeout():
                     print(f"⏰ Step 2 timeout - processing {len(audio_data)} bytes")
                     break
                 
@@ -1103,10 +1127,14 @@ def handle_technical_client(client_socket, client_address):
                         print(f"🔍 CF attempts: {workflow.cf_attempts}/{workflow.max_cf_attempts}")
                         print(f"🔍 About to continue to main workflow loop...")
                         
-                        # Restart CF dictation timer for next attempt
+                        # Restart timer for next attempt
                         if workflow.step == 1:
                             workflow.start_cf_dictation()
                             print(f"🔍 Restarted CF dictation timer for next attempt")
+                        elif workflow.step == 2:
+                            # For Impegnativa step, we need to reset the timeout timer
+                            workflow.start_impegnativa_dictation()
+                            print(f"🔍 Restarted Impegnativa dictation timer for next attempt")
                         
                         # Continue to next iteration of the outer workflow loop
                         print(f"🔍 Continuing to next workflow iteration...")
